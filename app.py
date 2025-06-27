@@ -3,13 +3,32 @@ import argparse
 import csv
 import os
 import sqlite3
-from datetime import datetime
+import sys
+from dataclasses import dataclass
+from typing import Optional
+from datetime import date, datetime
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # Optional dependency for Postgres
+    psycopg = None
+    dict_row = None
 
 DEFAULT_SEVERITY = "medium"
 DEFAULT_DIGEST_DAYS = 7
 DEFAULT_DIGEST_LIMIT = 8
 DEFAULT_TRIAGE_DAYS = 14
 DEFAULT_TRIAGE_LIMIT = 10
+POSTGRES_TABLE = "gsc_signals"
+
+
+@dataclass
+class DBConfig:
+    backend: str
+    db_path: Optional[str]
+    dsn: Optional[str]
+    table: str
 
 
 def utc_now():
@@ -19,10 +38,17 @@ def utc_now():
 def parse_date(value):
     if not value:
         return None
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").date()
-    except ValueError:
-        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S%z"):
+            try:
+                return datetime.strptime(value, fmt).date()
+            except ValueError:
+                continue
+    return None
 
 
 def default_db_path():
@@ -34,84 +60,149 @@ def ensure_data_dir(db_path):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
 
-def connect(db_path):
-    ensure_data_dir(db_path)
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+def resolve_db_config(args):
+    backend = args.backend or os.getenv("SIGNAL_CATALOG_BACKEND", "sqlite")
+    backend = backend.lower()
+    if backend not in {"sqlite", "postgres"}:
+        print(f"Unsupported backend '{backend}'. Use sqlite or postgres.")
+        sys.exit(1)
+    if backend == "postgres":
+        dsn = os.getenv("SIGNAL_CATALOG_DATABASE_URL")
+        if not dsn:
+            print("SIGNAL_CATALOG_DATABASE_URL is required for the postgres backend.")
+            sys.exit(1)
+        return DBConfig(backend="postgres", db_path=None, dsn=dsn, table=POSTGRES_TABLE)
+    return DBConfig(backend="sqlite", db_path=args.db, dsn=None, table="signals")
+
+
+def connect(db):
+    if db.backend == "sqlite":
+        if not db.db_path:
+            print("SQLite database path is missing.")
+            sys.exit(1)
+        ensure_data_dir(db.db_path)
+        conn = sqlite3.connect(db.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    if psycopg is None:
+        print("psycopg is required for the postgres backend. Install with pip.")
+        sys.exit(1)
+    conn = psycopg.connect(db.dsn, row_factory=dict_row)
     return conn
 
 
-def init_db(db_path):
-    conn = connect(db_path)
+def placeholder(db):
+    return "?" if db.backend == "sqlite" else "%s"
+
+
+def init_db(db):
+    conn = connect(db)
     cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            category TEXT,
-            severity TEXT,
-            owner TEXT,
-            due_date TEXT,
-            status TEXT NOT NULL,
-            notes TEXT,
-            source TEXT,
-            tags TEXT,
-            created_at TEXT NOT NULL,
-            closed_at TEXT
+    if db.backend == "sqlite":
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                category TEXT,
+                severity TEXT,
+                owner TEXT,
+                due_date TEXT,
+                status TEXT NOT NULL,
+                notes TEXT,
+                source TEXT,
+                tags TEXT,
+                created_at TEXT NOT NULL,
+                closed_at TEXT
+            )
+            """
         )
-        """
-    )
+    else:
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {db.table} (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                category TEXT,
+                severity TEXT,
+                owner TEXT,
+                due_date TEXT,
+                status TEXT NOT NULL,
+                notes TEXT,
+                source TEXT,
+                tags TEXT,
+                created_at TEXT NOT NULL,
+                closed_at TEXT
+            )
+            """
+        )
     conn.commit()
     conn.close()
 
 
-def add_signal(db_path, args):
-    conn = connect(db_path)
+def add_signal(db, args):
+    conn = connect(db)
     cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO signals
-        (title, category, severity, owner, due_date, status, notes, source, tags, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            args.title,
-            args.category,
-            args.severity or DEFAULT_SEVERITY,
-            args.owner,
-            args.due,
-            "open",
-            args.notes,
-            args.source,
-            args.tags,
-            utc_now(),
-        ),
+    p = placeholder(db)
+    values = (
+        args.title,
+        args.category,
+        args.severity or DEFAULT_SEVERITY,
+        args.owner,
+        args.due,
+        "open",
+        args.notes,
+        args.source,
+        args.tags,
+        utc_now(),
     )
-    conn.commit()
-    new_id = cur.lastrowid
+    if db.backend == "sqlite":
+        cur.execute(
+            f"""
+            INSERT INTO {db.table}
+            (title, category, severity, owner, due_date, status, notes, source, tags, created_at)
+            VALUES ({", ".join([p] * 10)})
+            """,
+            values,
+        )
+        conn.commit()
+        new_id = cur.lastrowid
+    else:
+        cur.execute(
+            f"""
+            INSERT INTO {db.table}
+            (title, category, severity, owner, due_date, status, notes, source, tags, created_at)
+            VALUES ({", ".join([p] * 10)})
+            RETURNING id
+            """,
+            values,
+        )
+        conn.commit()
+        row = cur.fetchone()
+        new_id = row["id"] if row else None
     conn.close()
     print(f"Added signal {new_id}.")
 
 
-def build_filters(args):
+def build_filters(args, param):
     filters = []
     values = []
 
     if args.status:
-        filters.append("status = ?")
+        filters.append(f"status = {param}")
         values.append(args.status)
     if args.category:
-        filters.append("category = ?")
+        filters.append(f"category = {param}")
         values.append(args.category)
     if args.owner:
-        filters.append("owner = ?")
+        filters.append(f"owner = {param}")
         values.append(args.owner)
     if args.severity:
-        filters.append("severity = ?")
+        filters.append(f"severity = {param}")
         values.append(args.severity)
     if args.search:
-        filters.append("(title LIKE ? OR notes LIKE ? OR source LIKE ?)")
+        filters.append(f"(title LIKE {param} OR notes LIKE {param} OR source LIKE {param})")
         pattern = f"%{args.search}%"
         values.extend([pattern, pattern, pattern])
 
@@ -121,19 +212,20 @@ def build_filters(args):
     return clause, values
 
 
-def list_signals(db_path, args):
-    conn = connect(db_path)
+def list_signals(db, args):
+    conn = connect(db)
     cur = conn.cursor()
-    clause, values = build_filters(args)
+    p = placeholder(db)
+    clause, values = build_filters(args, p)
     limit_clause = ""
     if args.limit:
-        limit_clause = "LIMIT ?"
+        limit_clause = f"LIMIT {p}"
         values.append(args.limit)
 
     cur.execute(
         f"""
         SELECT id, title, category, severity, owner, due_date, status, tags, created_at
-        FROM signals
+        FROM {db.table}
         {clause}
         ORDER BY created_at DESC
         {limit_clause}
@@ -181,20 +273,21 @@ def list_signals(db_path, args):
         print(" | ".join(line))
 
 
-def close_signal(db_path, signal_id, note):
-    conn = connect(db_path)
+def close_signal(db, signal_id, note):
+    conn = connect(db)
     cur = conn.cursor()
-    cur.execute("SELECT id FROM signals WHERE id = ?", (signal_id,))
+    p = placeholder(db)
+    cur.execute(f"SELECT id FROM {db.table} WHERE id = {p}", (signal_id,))
     if cur.fetchone() is None:
         conn.close()
         print(f"Signal {signal_id} not found.")
         return
 
     cur.execute(
-        """
-        UPDATE signals
-        SET status = ?, closed_at = ?, notes = COALESCE(notes, '') || ?
-        WHERE id = ?
+        f"""
+        UPDATE {db.table}
+        SET status = {p}, closed_at = {p}, notes = COALESCE(notes, '') || {p}
+        WHERE id = {p}
         """,
         (
             "closed",
@@ -208,20 +301,21 @@ def close_signal(db_path, signal_id, note):
     print(f"Closed signal {signal_id}.")
 
 
-def reopen_signal(db_path, signal_id, note):
-    conn = connect(db_path)
+def reopen_signal(db, signal_id, note):
+    conn = connect(db)
     cur = conn.cursor()
-    cur.execute("SELECT id FROM signals WHERE id = ?", (signal_id,))
+    p = placeholder(db)
+    cur.execute(f"SELECT id FROM {db.table} WHERE id = {p}", (signal_id,))
     if cur.fetchone() is None:
         conn.close()
         print(f"Signal {signal_id} not found.")
         return
 
     cur.execute(
-        """
-        UPDATE signals
-        SET status = ?, closed_at = NULL, notes = COALESCE(notes, '') || ?
-        WHERE id = ?
+        f"""
+        UPDATE {db.table}
+        SET status = {p}, closed_at = NULL, notes = COALESCE(notes, '') || {p}
+        WHERE id = {p}
         """,
         (
             "open",
@@ -234,8 +328,8 @@ def reopen_signal(db_path, signal_id, note):
     print(f"Reopened signal {signal_id}.")
 
 
-def summary(db_path):
-    conn = connect(db_path)
+def summary(db):
+    conn = connect(db)
     cur = conn.cursor()
 
     def print_section(label, query):
@@ -251,33 +345,34 @@ def summary(db_path):
 
     print_section(
         "By status",
-        "SELECT status, COUNT(*) FROM signals GROUP BY status ORDER BY COUNT(*) DESC",
+        f"SELECT status, COUNT(*) FROM {db.table} GROUP BY status ORDER BY COUNT(*) DESC",
     )
     print_section(
         "By category",
-        "SELECT category, COUNT(*) FROM signals GROUP BY category ORDER BY COUNT(*) DESC",
+        f"SELECT category, COUNT(*) FROM {db.table} GROUP BY category ORDER BY COUNT(*) DESC",
     )
     print_section(
         "By severity",
-        "SELECT severity, COUNT(*) FROM signals GROUP BY severity ORDER BY COUNT(*) DESC",
+        f"SELECT severity, COUNT(*) FROM {db.table} GROUP BY severity ORDER BY COUNT(*) DESC",
     )
     print_section(
         "By owner",
-        "SELECT owner, COUNT(*) FROM signals GROUP BY owner ORDER BY COUNT(*) DESC",
+        f"SELECT owner, COUNT(*) FROM {db.table} GROUP BY owner ORDER BY COUNT(*) DESC",
     )
 
     conn.close()
 
 
-def export_csv(db_path, args):
-    conn = connect(db_path)
+def export_csv(db, args):
+    conn = connect(db)
     cur = conn.cursor()
-    clause, values = build_filters(args)
+    p = placeholder(db)
+    clause, values = build_filters(args, p)
 
     cur.execute(
         f"""
         SELECT id, title, category, severity, owner, due_date, status, notes, source, tags, created_at, closed_at
-        FROM signals
+        FROM {db.table}
         {clause}
         ORDER BY created_at DESC
         """,
@@ -308,17 +403,17 @@ def export_csv(db_path, args):
         writer.writerow([row[h] for h in headers])
 
 
-def digest(db_path, args):
-    conn = connect(db_path)
+def digest(db, args):
+    conn = connect(db)
     cur = conn.cursor()
     today = datetime.utcnow().date()
 
     cur.execute(
         """
         SELECT id, title, category, severity, owner, due_date, status, notes, source, tags, created_at
-        FROM signals
+        FROM {table}
         ORDER BY created_at DESC
-        """
+        """.format(table=db.table)
     )
     rows = cur.fetchall()
     conn.close()
@@ -403,15 +498,15 @@ def digest(db_path, args):
     print(output)
 
 
-def triage(db_path, args):
-    conn = connect(db_path)
+def triage(db, args):
+    conn = connect(db)
     cur = conn.cursor()
     today = datetime.utcnow().date()
 
     cur.execute(
-        """
+        f"""
         SELECT id, title, category, severity, owner, due_date, status, notes, source, tags, created_at
-        FROM signals
+        FROM {db.table}
         WHERE status = 'open'
         ORDER BY created_at DESC
         """
@@ -519,6 +614,11 @@ def triage(db_path, args):
 def build_parser():
     parser = argparse.ArgumentParser(description="Group Scholar Signal Catalog")
     parser.add_argument("--db", default=default_db_path(), help="Path to the SQLite database")
+    parser.add_argument(
+        "--backend",
+        choices=["sqlite", "postgres"],
+        help="Storage backend (defaults to sqlite unless SIGNAL_CATALOG_BACKEND is set)",
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("init", help="Initialize the database")
@@ -574,34 +674,36 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    db = resolve_db_config(args)
 
     if args.command == "init":
-        init_db(args.db)
-        print(f"Initialized database at {args.db}.")
+        init_db(db)
+        location = db.db_path if db.backend == "sqlite" else db.table
+        print(f"Initialized database at {location}.")
         return
 
     if args.command is None:
         parser.print_help()
         return
 
-    init_db(args.db)
+    init_db(db)
 
     if args.command == "add":
-        add_signal(args.db, args)
+        add_signal(db, args)
     elif args.command == "list":
-        list_signals(args.db, args)
+        list_signals(db, args)
     elif args.command == "close":
-        close_signal(args.db, args.signal_id, args.note)
+        close_signal(db, args.signal_id, args.note)
     elif args.command == "reopen":
-        reopen_signal(args.db, args.signal_id, args.note)
+        reopen_signal(db, args.signal_id, args.note)
     elif args.command == "summary":
-        summary(args.db)
+        summary(db)
     elif args.command == "export":
-        export_csv(args.db, args)
+        export_csv(db, args)
     elif args.command == "digest":
-        digest(args.db, args)
+        digest(db, args)
     elif args.command == "triage":
-        triage(args.db, args)
+        triage(db, args)
     else:
         parser.print_help()
 

@@ -11,3 +11,8 @@
 ## Iteration 3
 - Added a triage command that ranks open signals by urgency, aging, and ownership gaps with a snapshot summary.
 - Updated README with triage usage.
+
+## Iteration 4
+- Added optional Postgres backend support with environment-based configuration while preserving SQLite defaults.
+- Added a Postgres seed script with realistic sample signals and documented backend setup in the README.
+- Added a requirements.txt entry for psycopg and seeded the production database table.

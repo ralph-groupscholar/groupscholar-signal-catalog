@@ -5,10 +5,28 @@ A lightweight CLI to log, track, and summarize program signals (risks, opportuni
 ## Quick start
 
 ```bash
-python app.py init
-python app.py add --title "Partner onboarding delay" --category "partner" --severity "high" --owner "Leah" --due "2026-02-21" --notes "Two partners missing data exports" --source "weekly call" --tags "onboarding,ops"
-python app.py list
-python app.py summary
+python3 app.py init
+python3 app.py add --title "Partner onboarding delay" --category "partner" --severity "high" --owner "Leah" --due "2026-02-21" --notes "Two partners missing data exports" --source "weekly call" --tags "onboarding,ops"
+python3 app.py list
+python3 app.py summary
+```
+
+## Postgres backend
+
+Use the Postgres backend for hosted deployments. Set `SIGNAL_CATALOG_DATABASE_URL` and either pass `--backend postgres` or set `SIGNAL_CATALOG_BACKEND=postgres`.
+
+```bash
+pip install -r requirements.txt
+export SIGNAL_CATALOG_DATABASE_URL="postgres://user:pass@host:port/db"
+python3 app.py --backend postgres init
+python3 app.py --backend postgres list --status open
+```
+
+To seed the production database with realistic sample data:
+
+```bash
+export SIGNAL_CATALOG_DATABASE_URL="postgres://user:pass@host:port/db"
+python3 scripts/seed_postgres.py
 ```
 
 ## Commands
@@ -26,13 +44,13 @@ python app.py summary
 ## Examples
 
 ```bash
-python app.py list --status open --category partner
-python app.py close 3 --note "Partner sent exports"
-python app.py export --status open --out data/open-signals.csv
-python app.py digest --days 14 --out data/weekly-digest.md
-python app.py triage --days 10 --limit 12
+python3 app.py list --status open --category partner
+python3 app.py close 3 --note "Partner sent exports"
+python3 app.py export --status open --out data/open-signals.csv
+python3 app.py digest --days 14 --out data/weekly-digest.md
+python3 app.py triage --days 10 --limit 12
 ```
 
 ## Data
 
-The database lives at `data/signals.db` by default. Use `--db` to point elsewhere.
+The database lives at `data/signals.db` by default. Use `--db` to point elsewhere. Postgres uses the `gsc_signals` table.
