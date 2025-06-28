@@ -26,12 +26,13 @@ To seed the production database with realistic sample data:
 
 ```bash
 export SIGNAL_CATALOG_DATABASE_URL="postgres://user:pass@host:port/db"
-python3 scripts/seed_postgres.py
+python3 app.py --backend postgres seed
 ```
 
 ## Commands
 
 - `init`: create the local SQLite database
+- `seed`: insert sample signals if none exist
 - `add`: add a signal record
 - `list`: list signals with filters
 - `close`: close a signal by id
@@ -53,4 +54,4 @@ python3 app.py triage --days 10 --limit 12
 
 ## Data
 
-The database lives at `data/signals.db` by default. Use `--db` to point elsewhere. Postgres uses the `gsc_signals` table.
+The database lives at `data/signals.db` by default. Use `--db` to point elsewhere. Postgres uses the `groupscholar_signal_catalog.signals` table.

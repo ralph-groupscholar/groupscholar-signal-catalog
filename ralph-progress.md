@@ -16,3 +16,8 @@
 - Added optional Postgres backend support with environment-based configuration while preserving SQLite defaults.
 - Added a Postgres seed script with realistic sample signals and documented backend setup in the README.
 - Added a requirements.txt entry for psycopg and seeded the production database table.
+
+## Iteration 4
+- Added Postgres schema-backed storage support refinements (schema creation, datetime/date handling, optional database-url flag).
+- Introduced a seed command with realistic starter signals and seeded the production Postgres table.
+- Updated README and added requirements for psycopg.

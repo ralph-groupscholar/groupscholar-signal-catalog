@@ -6,7 +6,7 @@ import sqlite3
 import sys
 from dataclasses import dataclass
 from typing import Optional
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 try:
     import psycopg
@@ -20,7 +20,8 @@ DEFAULT_DIGEST_DAYS = 7
 DEFAULT_DIGEST_LIMIT = 8
 DEFAULT_TRIAGE_DAYS = 14
 DEFAULT_TRIAGE_LIMIT = 10
-POSTGRES_TABLE = "gsc_signals"
+POSTGRES_SCHEMA = "groupscholar_signal_catalog"
+POSTGRES_TABLE = f"{POSTGRES_SCHEMA}.signals"
 
 
 @dataclass
@@ -33,6 +34,10 @@ class DBConfig:
 
 def utc_now():
     return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def utc_days_ago(days):
+    return (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def parse_date(value):
@@ -67,9 +72,9 @@ def resolve_db_config(args):
         print(f"Unsupported backend '{backend}'. Use sqlite or postgres.")
         sys.exit(1)
     if backend == "postgres":
-        dsn = os.getenv("SIGNAL_CATALOG_DATABASE_URL")
+        dsn = args.database_url or os.getenv("SIGNAL_CATALOG_DATABASE_URL") or os.getenv("DATABASE_URL")
         if not dsn:
-            print("SIGNAL_CATALOG_DATABASE_URL is required for the postgres backend.")
+            print("SIGNAL_CATALOG_DATABASE_URL (or DATABASE_URL) is required for the postgres backend.")
             sys.exit(1)
         return DBConfig(backend="postgres", db_path=None, dsn=dsn, table=POSTGRES_TABLE)
     return DBConfig(backend="sqlite", db_path=args.db, dsn=None, table="signals")
@@ -119,21 +124,22 @@ def init_db(db):
             """
         )
     else:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {POSTGRES_SCHEMA}")
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {db.table} (
-                id SERIAL PRIMARY KEY,
+                id BIGSERIAL PRIMARY KEY,
                 title TEXT NOT NULL,
                 category TEXT,
                 severity TEXT,
                 owner TEXT,
-                due_date TEXT,
+                due_date DATE,
                 status TEXT NOT NULL,
                 notes TEXT,
                 source TEXT,
                 tags TEXT,
-                created_at TEXT NOT NULL,
-                closed_at TEXT
+                created_at TIMESTAMPTZ NOT NULL,
+                closed_at TIMESTAMPTZ
             )
             """
         )
@@ -183,6 +189,153 @@ def add_signal(db, args):
         new_id = row["id"] if row else None
     conn.close()
     print(f"Added signal {new_id}.")
+
+
+def seed_signals(db):
+    conn = connect(db)
+    cur = conn.cursor()
+    cur.execute(f"SELECT COUNT(*) AS total FROM {db.table}")
+    row = cur.fetchone()
+    existing = row[0] if not isinstance(row, dict) else row.get("total", 0)
+    if existing and int(existing) > 0:
+        conn.close()
+        print("Seed skipped; signals already exist.")
+        return
+
+    p = placeholder(db)
+    seed_rows = [
+        {
+            "title": "FAFSA verification delays impacting award timing",
+            "category": "financial_aid",
+            "severity": "high",
+            "owner": "Janelle",
+            "due_date": "2026-02-20",
+            "status": "open",
+            "notes": "Multiple scholars flagged for verification; track impact on March disbursements.",
+            "source": "financial aid sync",
+            "tags": "fa,disbursement",
+            "created_at": utc_days_ago(10),
+            "closed_at": None,
+        },
+        {
+            "title": "Partner onboarding data feed missing graduation fields",
+            "category": "partner",
+            "severity": "medium",
+            "owner": "Leah",
+            "due_date": "2026-02-18",
+            "status": "open",
+            "notes": "Need schema update request before March intake imports.",
+            "source": "partner ops",
+            "tags": "onboarding,ops",
+            "created_at": utc_days_ago(6),
+            "closed_at": None,
+        },
+        {
+            "title": "Scholar sentiment dip for virtual advising sessions",
+            "category": "community",
+            "severity": "medium",
+            "owner": "Mina",
+            "due_date": "2026-02-25",
+            "status": "open",
+            "notes": "Survey comments cite scheduling friction; recommend pilot with office hours.",
+            "source": "pulse survey",
+            "tags": "sentiment,advising",
+            "created_at": utc_days_ago(4),
+            "closed_at": None,
+        },
+        {
+            "title": "Donor Q2 reporting needs updated outcomes highlights",
+            "category": "fundraising",
+            "severity": "high",
+            "owner": "Rico",
+            "due_date": "2026-02-22",
+            "status": "open",
+            "notes": "Prepare 3 new scholar vignettes and updated retention numbers.",
+            "source": "fundraising sync",
+            "tags": "donor,briefing",
+            "created_at": utc_days_ago(8),
+            "closed_at": None,
+        },
+        {
+            "title": "STEM cohort mentoring slots overbooked",
+            "category": "mentorship",
+            "severity": "high",
+            "owner": "Noah",
+            "due_date": "2026-02-15",
+            "status": "open",
+            "notes": "Waitlist building; consider adding two volunteer mentors.",
+            "source": "mentor map",
+            "tags": "mentors,capacity",
+            "created_at": utc_days_ago(12),
+            "closed_at": None,
+        },
+        {
+            "title": "Scholar outreach cadence missed for January cohort",
+            "category": "operations",
+            "severity": "critical",
+            "owner": "Avery",
+            "due_date": "2026-02-12",
+            "status": "closed",
+            "notes": "Backfilled touchpoints and updated cadence playbook.",
+            "source": "ops retro",
+            "tags": "cadence,retention",
+            "created_at": utc_days_ago(20),
+            "closed_at": utc_days_ago(5),
+        },
+        {
+            "title": "Scholarship award acceptance rate trending down",
+            "category": "awards",
+            "severity": "medium",
+            "owner": "Priya",
+            "due_date": "2026-02-28",
+            "status": "open",
+            "notes": "Analyze yield vs offer package; coordinate with comms.",
+            "source": "award allocator",
+            "tags": "yield,analysis",
+            "created_at": utc_days_ago(7),
+            "closed_at": None,
+        },
+        {
+            "title": "Partner renewal risk flagged for Horizon Foundation",
+            "category": "partner",
+            "severity": "high",
+            "owner": "Diego",
+            "due_date": "2026-02-19",
+            "status": "open",
+            "notes": "Need updated impact snapshot ahead of renewal call.",
+            "source": "renewal tracker",
+            "tags": "renewal,impact",
+            "created_at": utc_days_ago(9),
+            "closed_at": None,
+        },
+    ]
+
+    cur.executemany(
+        f"""
+        INSERT INTO {db.table}
+        (title, category, severity, owner, due_date, status, notes, source, tags, created_at, closed_at)
+        VALUES ({", ".join([p] * 11)})
+        """,
+        [
+            (
+                row["title"],
+                row["category"],
+                row["severity"],
+                row["owner"],
+                row["due_date"],
+                row["status"],
+                row["notes"],
+                row["source"],
+                row["tags"],
+                row["created_at"],
+                row["closed_at"],
+            )
+            for row in seed_rows
+        ],
+    )
+    conn.commit()
+    conn.close()
+    print(f"Seeded {len(seed_rows)} signals.")
 
 
 def build_filters(args, param):
@@ -440,7 +593,7 @@ def digest(db, args):
     recent = []
     for row in rows:
         created = row["created_at"]
-        created_date = parse_date(created[:10]) if created else None
+        created_date = parse_date(created)
         if created_date and created_date.toordinal() >= recent_cutoff:
             recent.append(row)
 
@@ -523,7 +676,7 @@ def triage(db, args):
 
     for row in rows:
         due = parse_date(row["due_date"])
-        created_date = parse_date(row["created_at"][:10]) if row["created_at"] else None
+        created_date = parse_date(row["created_at"])
         age_days = (today - created_date).days if created_date else 0
 
         score = severity_weights.get(row["severity"] or DEFAULT_SEVERITY, 2) * 10
@@ -619,9 +772,14 @@ def build_parser():
         choices=["sqlite", "postgres"],
         help="Storage backend (defaults to sqlite unless SIGNAL_CATALOG_BACKEND is set)",
     )
+    parser.add_argument(
+        "--database-url",
+        help="Postgres connection string (or set SIGNAL_CATALOG_DATABASE_URL)",
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("init", help="Initialize the database")
+    subparsers.add_parser("seed", help="Insert sample signals if none exist")
 
     add_parser = subparsers.add_parser("add", help="Add a signal")
     add_parser.add_argument("--title", required=True)
@@ -690,6 +848,8 @@ def main():
 
     if args.command == "add":
         add_signal(db, args)
+    elif args.command == "seed":
+        seed_signals(db)
     elif args.command == "list":
         list_signals(db, args)
     elif args.command == "close":
