@@ -37,6 +37,7 @@ python3 app.py --backend postgres seed
 - `list`: list signals with filters
 - `close`: close a signal by id
 - `reopen`: reopen a signal by id
+- `update`: update signal fields or append notes
 - `summary`: rollups by status, category, severity, owner
 - `export`: export filtered signals to CSV
 - `digest`: generate a markdown digest of overdue, due soon, and recent signals
@@ -47,6 +48,8 @@ python3 app.py --backend postgres seed
 ```bash
 python3 app.py list --status open --category partner
 python3 app.py close 3 --note "Partner sent exports"
+python3 app.py update 3 --owner "Diego" --due "2026-02-26" --append-note "Aligned on new delivery date"
+python3 app.py update 5 --status closed --notes "Resolved after mentor onboarding"
 python3 app.py export --status open --out data/open-signals.csv
 python3 app.py digest --days 14 --out data/weekly-digest.md
 python3 app.py triage --days 10 --limit 12

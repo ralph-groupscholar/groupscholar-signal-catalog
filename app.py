@@ -481,6 +481,104 @@ def reopen_signal(db, signal_id, note):
     print(f"Reopened signal {signal_id}.")
 
 
+def update_signal(db, args):
+    if args.owner and args.clear_owner:
+        print("Choose either --owner or --clear-owner, not both.")
+        return
+    if args.category and args.clear_category:
+        print("Choose either --category or --clear-category, not both.")
+        return
+    if args.due and args.clear_due:
+        print("Choose either --due or --clear-due, not both.")
+        return
+    if args.source and args.clear_source:
+        print("Choose either --source or --clear-source, not both.")
+        return
+    if args.tags and args.clear_tags:
+        print("Choose either --tags or --clear-tags, not both.")
+        return
+    if args.notes and args.clear_notes:
+        print("Choose either --notes or --clear-notes, not both.")
+        return
+
+    conn = connect(db)
+    cur = conn.cursor()
+    p = placeholder(db)
+    cur.execute(f"SELECT id FROM {db.table} WHERE id = {p}", (args.signal_id,))
+    if cur.fetchone() is None:
+        conn.close()
+        print(f"Signal {args.signal_id} not found.")
+        return
+
+    updates = []
+    values = []
+
+    def set_value(field, value):
+        updates.append(f"{field} = {p}")
+        values.append(value)
+
+    if args.title is not None:
+        set_value("title", args.title)
+    if args.category is not None:
+        set_value("category", args.category)
+    if args.clear_category:
+        updates.append("category = NULL")
+    if args.severity is not None:
+        set_value("severity", args.severity)
+    if args.owner is not None:
+        set_value("owner", args.owner)
+    if args.clear_owner:
+        updates.append("owner = NULL")
+    if args.due is not None:
+        set_value("due_date", args.due)
+    if args.clear_due:
+        updates.append("due_date = NULL")
+    if args.source is not None:
+        set_value("source", args.source)
+    if args.clear_source:
+        updates.append("source = NULL")
+    if args.tags is not None:
+        set_value("tags", args.tags)
+    if args.clear_tags:
+        updates.append("tags = NULL")
+
+    if args.status is not None:
+        set_value("status", args.status)
+        if args.status == "closed":
+            set_value("closed_at", utc_now())
+        else:
+            updates.append("closed_at = NULL")
+
+    if args.clear_notes:
+        updates.append("notes = NULL")
+
+    if args.notes is not None:
+        note_value = args.notes
+        if args.append_note:
+            note_value = f"{note_value}\n[Update {date.today().isoformat()}] {args.append_note}"
+        set_value("notes", note_value)
+    elif args.append_note:
+        updates.append(f"notes = COALESCE(notes, '') || {p}")
+        values.append(f"\n[Update {date.today().isoformat()}] {args.append_note}")
+
+    if not updates:
+        conn.close()
+        print("No updates provided.")
+        return
+
+    cur.execute(
+        f"""
+        UPDATE {db.table}
+        SET {", ".join(updates)}
+        WHERE id = {p}
+        """,
+        (*values, args.signal_id),
+    )
+    conn.commit()
+    conn.close()
+    print(f"Updated signal {args.signal_id}.")
+
+
 def summary(db):
     conn = connect(db)
     cur = conn.cursor()
@@ -807,6 +905,25 @@ def build_parser():
     reopen_parser.add_argument("signal_id", type=int)
     reopen_parser.add_argument("--note")
 
+    update_parser = subparsers.add_parser("update", help="Update fields on a signal")
+    update_parser.add_argument("signal_id", type=int)
+    update_parser.add_argument("--title")
+    update_parser.add_argument("--category")
+    update_parser.add_argument("--severity", choices=["low", "medium", "high", "critical"])
+    update_parser.add_argument("--owner")
+    update_parser.add_argument("--due", help="Due date (YYYY-MM-DD)")
+    update_parser.add_argument("--status", choices=["open", "closed"])
+    update_parser.add_argument("--notes")
+    update_parser.add_argument("--append-note")
+    update_parser.add_argument("--source")
+    update_parser.add_argument("--tags")
+    update_parser.add_argument("--clear-owner", action="store_true")
+    update_parser.add_argument("--clear-category", action="store_true")
+    update_parser.add_argument("--clear-due", action="store_true")
+    update_parser.add_argument("--clear-source", action="store_true")
+    update_parser.add_argument("--clear-tags", action="store_true")
+    update_parser.add_argument("--clear-notes", action="store_true")
+
     subparsers.add_parser("summary", help="Show summary rollups")
 
     export_parser = subparsers.add_parser("export", help="Export signals to CSV")
@@ -856,6 +973,8 @@ def main():
         close_signal(db, args.signal_id, args.note)
     elif args.command == "reopen":
         reopen_signal(db, args.signal_id, args.note)
+    elif args.command == "update":
+        update_signal(db, args)
     elif args.command == "summary":
         summary(db)
     elif args.command == "export":
