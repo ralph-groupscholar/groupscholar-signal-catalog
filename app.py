@@ -20,6 +20,8 @@ DEFAULT_DIGEST_DAYS = 7
 DEFAULT_DIGEST_LIMIT = 8
 DEFAULT_TRIAGE_DAYS = 14
 DEFAULT_TRIAGE_LIMIT = 10
+DEFAULT_AUDIT_LIMIT = 8
+DEFAULT_AUDIT_STALE_DAYS = 21
 POSTGRES_SCHEMA = "groupscholar_signal_catalog"
 POSTGRES_TABLE = f"{POSTGRES_SCHEMA}.signals"
 
@@ -862,6 +864,105 @@ def triage(db, args):
         print(" | ".join(line))
 
 
+def audit(db, args):
+    conn = connect(db)
+    cur = conn.cursor()
+    today = datetime.utcnow().date()
+
+    cur.execute(
+        f"""
+        SELECT id, title, category, severity, owner, due_date, status, notes, source, tags, created_at
+        FROM {db.table}
+        WHERE status = 'open'
+        ORDER BY created_at DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        print("No open signals found.")
+        return
+
+    missing_owner = []
+    missing_due = []
+    missing_category = []
+    missing_severity = []
+    missing_tags = []
+    missing_source = []
+    aging = []
+    overdue = []
+
+    for row in rows:
+        due = parse_date(row["due_date"])
+        created_date = parse_date(row["created_at"])
+        age_days = (today - created_date).days if created_date else 0
+
+        if not row["owner"]:
+            missing_owner.append(row)
+        if not row["due_date"]:
+            missing_due.append(row)
+        if not row["category"]:
+            missing_category.append(row)
+        if not row["severity"]:
+            missing_severity.append(row)
+        if not row["tags"]:
+            missing_tags.append(row)
+        if not row["source"]:
+            missing_source.append(row)
+        if age_days >= args.stale_days:
+            aging.append((row, age_days))
+        if due and due < today:
+            overdue.append(row)
+
+    def line_for(row, extra=""):
+        owner = row["owner"] or "Unassigned"
+        due = row["due_date"] or "No due date"
+        category = row["category"] or "Unspecified"
+        suffix = f" — {extra}" if extra else ""
+        return f"- [{row['id']}] {row['title']} ({category}) — {owner} — due {due}{suffix}"
+
+    print("Audit Snapshot")
+    print("---------------")
+    print(f"Open signals: {len(rows)}")
+    print(f"Missing owner: {len(missing_owner)}")
+    print(f"Missing due date: {len(missing_due)}")
+    print(f"Missing category: {len(missing_category)}")
+    print(f"Missing severity: {len(missing_severity)}")
+    print(f"Missing tags: {len(missing_tags)}")
+    print(f"Missing source: {len(missing_source)}")
+    print(f"Aging (>= {args.stale_days} days): {len(aging)}")
+    print(f"Overdue: {len(overdue)}")
+
+    sections = [
+        ("Missing Owner", missing_owner, ""),
+        ("Missing Due Date", missing_due, ""),
+        ("Missing Category", missing_category, ""),
+        ("Missing Severity", missing_severity, ""),
+        ("Missing Tags", missing_tags, ""),
+        ("Missing Source", missing_source, ""),
+        (f"Aging Open Signals (>= {args.stale_days} days)", [item[0] for item in aging], "age"),
+        ("Overdue Open Signals", overdue, ""),
+    ]
+
+    for label, items, extra in sections:
+        print(f"\n{label}")
+        print("-" * len(label))
+        if not items:
+            print("(none)")
+            continue
+        for item in items[: args.limit]:
+            if extra == "age":
+                age_days = next(
+                    (age for row, age in aging if row["id"] == item["id"]),
+                    None,
+                )
+                age_text = f"{age_days} days old" if age_days is not None else ""
+                print(line_for(item, age_text))
+            else:
+                print(line_for(item))
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Group Scholar Signal Catalog")
     parser.add_argument("--db", default=default_db_path(), help="Path to the SQLite database")
@@ -943,6 +1044,10 @@ def build_parser():
     triage_parser.add_argument("--days", type=int, default=DEFAULT_TRIAGE_DAYS)
     triage_parser.add_argument("--limit", type=int, default=DEFAULT_TRIAGE_LIMIT)
 
+    audit_parser = subparsers.add_parser("audit", help="Audit open signals for missing fields")
+    audit_parser.add_argument("--limit", type=int, default=DEFAULT_AUDIT_LIMIT)
+    audit_parser.add_argument("--stale-days", type=int, default=DEFAULT_AUDIT_STALE_DAYS)
+
     return parser
 
 
@@ -983,6 +1088,8 @@ def main():
         digest(db, args)
     elif args.command == "triage":
         triage(db, args)
+    elif args.command == "audit":
+        audit(db, args)
     else:
         parser.print_help()
 

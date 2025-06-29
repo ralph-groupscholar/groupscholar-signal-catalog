@@ -20,3 +20,7 @@
 ## Iteration 5
 - Added an update command to edit signal fields, append notes, or clear values while handling status transitions.
 - Documented update usage in the README examples.
+
+## Iteration 83
+- Added an audit command to flag open signals missing owners, due dates, categories, severity, tags, or sources, plus aging/overdue alerts.
+- Documented audit usage in the README.
