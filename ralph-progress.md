@@ -28,3 +28,7 @@
 ## Iteration 83
 - Added an audit command to flag open signals missing owners, due dates, categories, severity, tags, or sources, plus aging/overdue alerts.
 - Documented audit usage in the README.
+
+## Iteration 84
+- Expanded the workload report to support markdown or table output with optional file export.
+- Updated the README with workload format and output examples.

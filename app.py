@@ -963,11 +963,6 @@ def workload(db, args):
 
     rows_out.sort(key=lambda item: (item["overdue"], item["open"], item["high_critical"]), reverse=True)
 
-    print("Workload Snapshot")
-    print("-----------------")
-    print(f"Open signals: {len(rows)}")
-    print(f"Due soon window: {args.days} days")
-
     columns = [
         ("Owner", "owner"),
         ("Open", "open"),
@@ -979,28 +974,68 @@ def workload(db, args):
         ("High/Crit", "high_critical"),
     ]
 
-    widths = []
-    for label, key in columns:
-        width = len(label)
+    def build_table_lines():
+        widths = []
+        for label, key in columns:
+            width = len(label)
+            for row in rows_out:
+                value = "" if row[key] is None else str(row[key])
+                width = max(width, min(len(value), 40))
+            widths.append(width)
+
+        header = " | ".join(label.ljust(widths[i]) for i, (label, _) in enumerate(columns))
+        divider = "-+-".join("-" * widths[i] for i in range(len(columns)))
+        lines = [
+            "Workload Snapshot",
+            "-----------------",
+            f"Open signals: {len(rows)}",
+            f"Due soon window: {args.days} days",
+            "",
+            header,
+            divider,
+        ]
         for row in rows_out:
-            value = "" if row[key] is None else str(row[key])
-            width = max(width, min(len(value), 40))
-        widths.append(width)
+            line = []
+            for i, (_, key) in enumerate(columns):
+                value = "" if row[key] is None else str(row[key])
+                if len(value) > 40:
+                    value = value[:37] + "..."
+                line.append(value.ljust(widths[i]))
+            lines.append(" | ".join(line))
+        return lines
 
-    header = " | ".join(label.ljust(widths[i]) for i, (label, _) in enumerate(columns))
-    divider = "-+-".join("-" * widths[i] for i in range(len(columns)))
-    print("")
-    print(header)
-    print(divider)
+    def build_markdown_lines():
+        header_cells = [label for label, _ in columns]
+        lines = [
+            "# Signal Workload",
+            "",
+            f"- Open signals: {len(rows)}",
+            f"- Due soon window: {args.days} days",
+            "",
+            "| " + " | ".join(header_cells) + " |",
+            "| " + " | ".join(["---"] * len(header_cells)) + " |",
+        ]
+        for row in rows_out:
+            lines.append(
+                "| "
+                + " | ".join(str(row[key]) if row[key] is not None else "" for _, key in columns)
+                + " |"
+            )
+        return lines
 
-    for row in rows_out:
-        line = []
-        for i, (_, key) in enumerate(columns):
-            value = "" if row[key] is None else str(row[key])
-            if len(value) > 40:
-                value = value[:37] + "..."
-            line.append(value.ljust(widths[i]))
-        print(" | ".join(line))
+    if args.format == "markdown":
+        output = "\n".join(build_markdown_lines()) + "\n"
+    else:
+        output = "\n".join(build_table_lines()) + "\n"
+
+    if args.out:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as handle:
+            handle.write(output)
+        print(f"Wrote workload to {args.out}.")
+        return
+
+    print(output, end="")
 
 
 def audit(db, args):
@@ -1279,6 +1314,8 @@ def build_parser():
 
     workload_parser = subparsers.add_parser("workload", help="Summarize open-signal workload by owner")
     workload_parser.add_argument("--days", type=int, default=DEFAULT_WORKLOAD_DAYS)
+    workload_parser.add_argument("--format", choices=["table", "markdown"], default="table")
+    workload_parser.add_argument("--out", help="Output file path for workload report")
 
     audit_parser = subparsers.add_parser("audit", help="Audit open signals for missing fields")
     audit_parser.add_argument("--limit", type=int, default=DEFAULT_AUDIT_LIMIT)
