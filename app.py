@@ -4,6 +4,7 @@ import csv
 import os
 import sqlite3
 import sys
+import statistics
 from dataclasses import dataclass
 from typing import Optional
 from datetime import date, datetime, timedelta
@@ -20,8 +21,10 @@ DEFAULT_DIGEST_DAYS = 7
 DEFAULT_DIGEST_LIMIT = 8
 DEFAULT_TRIAGE_DAYS = 14
 DEFAULT_TRIAGE_LIMIT = 10
+DEFAULT_METRICS_DUE_DAYS = 14
 DEFAULT_AUDIT_LIMIT = 8
 DEFAULT_AUDIT_STALE_DAYS = 21
+DEFAULT_WORKLOAD_DAYS = 14
 POSTGRES_SCHEMA = "groupscholar_signal_catalog"
 POSTGRES_TABLE = f"{POSTGRES_SCHEMA}.signals"
 
@@ -53,6 +56,27 @@ def parse_date(value):
         for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S%z"):
             try:
                 return datetime.strptime(value, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+def parse_datetime(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    if isinstance(value, str):
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S%z",
+            "%Y-%m-%d",
+        ):
+            try:
+                return datetime.strptime(value, fmt)
             except ValueError:
                 continue
     return None
@@ -864,6 +888,121 @@ def triage(db, args):
         print(" | ".join(line))
 
 
+def workload(db, args):
+    conn = connect(db)
+    cur = conn.cursor()
+    today = datetime.utcnow().date()
+
+    cur.execute(
+        f"""
+        SELECT id, title, category, severity, owner, due_date, status, created_at
+        FROM {db.table}
+        WHERE status = 'open'
+        ORDER BY created_at DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        print("No open signals found.")
+        return
+
+    buckets = {}
+    for row in rows:
+        owner = row["owner"] or "Unassigned"
+        due = parse_date(row["due_date"])
+        created = parse_date(row["created_at"])
+        age_days = (today - created).days if created else 0
+
+        bucket = buckets.setdefault(
+            owner,
+            {
+                "open": 0,
+                "overdue": 0,
+                "due_soon": 0,
+                "due_later": 0,
+                "no_due": 0,
+                "age_total": 0,
+                "age_count": 0,
+                "high_critical": 0,
+            },
+        )
+
+        bucket["open"] += 1
+        bucket["age_total"] += age_days
+        bucket["age_count"] += 1
+
+        if (row["severity"] or DEFAULT_SEVERITY) in {"high", "critical"}:
+            bucket["high_critical"] += 1
+
+        if due is None:
+            bucket["no_due"] += 1
+        elif due < today:
+            bucket["overdue"] += 1
+        elif (due - today).days <= args.days:
+            bucket["due_soon"] += 1
+        else:
+            bucket["due_later"] += 1
+
+    rows_out = []
+    for owner, stats in buckets.items():
+        avg_age = round(stats["age_total"] / stats["age_count"], 1) if stats["age_count"] else 0
+        rows_out.append(
+            {
+                "owner": owner,
+                "open": stats["open"],
+                "overdue": stats["overdue"],
+                "due_soon": stats["due_soon"],
+                "due_later": stats["due_later"],
+                "no_due": stats["no_due"],
+                "avg_age": avg_age,
+                "high_critical": stats["high_critical"],
+            }
+        )
+
+    rows_out.sort(key=lambda item: (item["overdue"], item["open"], item["high_critical"]), reverse=True)
+
+    print("Workload Snapshot")
+    print("-----------------")
+    print(f"Open signals: {len(rows)}")
+    print(f"Due soon window: {args.days} days")
+
+    columns = [
+        ("Owner", "owner"),
+        ("Open", "open"),
+        ("Overdue", "overdue"),
+        ("Due soon", "due_soon"),
+        ("Due later", "due_later"),
+        ("No due", "no_due"),
+        ("Avg age", "avg_age"),
+        ("High/Crit", "high_critical"),
+    ]
+
+    widths = []
+    for label, key in columns:
+        width = len(label)
+        for row in rows_out:
+            value = "" if row[key] is None else str(row[key])
+            width = max(width, min(len(value), 40))
+        widths.append(width)
+
+    header = " | ".join(label.ljust(widths[i]) for i, (label, _) in enumerate(columns))
+    divider = "-+-".join("-" * widths[i] for i in range(len(columns)))
+    print("")
+    print(header)
+    print(divider)
+
+    for row in rows_out:
+        line = []
+        for i, (_, key) in enumerate(columns):
+            value = "" if row[key] is None else str(row[key])
+            if len(value) > 40:
+                value = value[:37] + "..."
+            line.append(value.ljust(widths[i]))
+        print(" | ".join(line))
+
+
 def audit(db, args):
     conn = connect(db)
     cur = conn.cursor()
@@ -963,6 +1102,100 @@ def audit(db, args):
                 print(line_for(item))
 
 
+def metrics(db, args):
+    conn = connect(db)
+    cur = conn.cursor()
+    today = datetime.utcnow()
+
+    cur.execute(
+        f"""
+        SELECT id, title, category, severity, owner, due_date, status, created_at, closed_at
+        FROM {db.table}
+        ORDER BY created_at DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        print("No signals found.")
+        return
+
+    open_rows = [row for row in rows if row["status"] == "open"]
+    closed_rows = [row for row in rows if row["status"] == "closed"]
+
+    open_ages = []
+    open_overdue = 0
+    open_due_soon = 0
+    open_unassigned = 0
+    open_by_severity = {"low": 0, "medium": 0, "high": 0, "critical": 0, "unspecified": 0}
+
+    for row in open_rows:
+        created_dt = parse_datetime(row["created_at"])
+        if created_dt:
+            open_ages.append((today - created_dt).days)
+        due = parse_date(row["due_date"])
+        if due and due < today.date():
+            open_overdue += 1
+        elif due and (due - today.date()).days <= args.due_days:
+            open_due_soon += 1
+        if not row["owner"]:
+            open_unassigned += 1
+        severity = row["severity"] or "unspecified"
+        open_by_severity[severity] = open_by_severity.get(severity, 0) + 1
+
+    def avg(values):
+        return round(sum(values) / len(values), 1) if values else 0
+
+    def median(values):
+        return round(statistics.median(values), 1) if values else 0
+
+    closed_cycle = []
+    for row in closed_rows:
+        created_dt = parse_datetime(row["created_at"])
+        closed_dt = parse_datetime(row["closed_at"])
+        if created_dt and closed_dt:
+            closed_cycle.append((closed_dt - created_dt).days)
+
+    oldest_open = []
+    for row in open_rows:
+        created_dt = parse_datetime(row["created_at"])
+        if not created_dt:
+            continue
+        age_days = (today - created_dt).days
+        oldest_open.append((age_days, row))
+    oldest_open.sort(key=lambda item: item[0], reverse=True)
+
+    print("Signal Metrics")
+    print("---------------")
+    print(f"Total signals: {len(rows)}")
+    print(f"Open signals: {len(open_rows)}")
+    print(f"Closed signals: {len(closed_rows)}")
+    print(f"Open overdue: {open_overdue}")
+    print(f"Open due soon (next {args.due_days} days): {open_due_soon}")
+    print(f"Open unassigned: {open_unassigned}")
+    print(f"Avg open age (days): {avg(open_ages)}")
+    print(f"Median open age (days): {median(open_ages)}")
+    print(f"Avg close cycle (days): {avg(closed_cycle)}")
+    print(f"Median close cycle (days): {median(closed_cycle)}")
+
+    print("\nOpen signals by severity")
+    print("------------------------")
+    for severity in ("critical", "high", "medium", "low", "unspecified"):
+        print(f"{severity.title()}: {open_by_severity.get(severity, 0)}")
+
+    print("\nOldest open signals")
+    print("-------------------")
+    if not oldest_open:
+        print("(none)")
+        return
+    for age_days, row in oldest_open[: args.limit]:
+        owner = row["owner"] or "Unassigned"
+        due = row["due_date"] or "No due date"
+        category = row["category"] or "Unspecified"
+        print(f"- [{row['id']}] {row['title']} ({category}) — {owner} — due {due} — {age_days} days open")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Group Scholar Signal Catalog")
     parser.add_argument("--db", default=default_db_path(), help="Path to the SQLite database")
@@ -1044,9 +1277,16 @@ def build_parser():
     triage_parser.add_argument("--days", type=int, default=DEFAULT_TRIAGE_DAYS)
     triage_parser.add_argument("--limit", type=int, default=DEFAULT_TRIAGE_LIMIT)
 
+    workload_parser = subparsers.add_parser("workload", help="Summarize open-signal workload by owner")
+    workload_parser.add_argument("--days", type=int, default=DEFAULT_WORKLOAD_DAYS)
+
     audit_parser = subparsers.add_parser("audit", help="Audit open signals for missing fields")
     audit_parser.add_argument("--limit", type=int, default=DEFAULT_AUDIT_LIMIT)
     audit_parser.add_argument("--stale-days", type=int, default=DEFAULT_AUDIT_STALE_DAYS)
+
+    metrics_parser = subparsers.add_parser("metrics", help="Show operational metrics for signals")
+    metrics_parser.add_argument("--due-days", type=int, default=DEFAULT_METRICS_DUE_DAYS)
+    metrics_parser.add_argument("--limit", type=int, default=8)
 
     return parser
 
@@ -1088,8 +1328,12 @@ def main():
         digest(db, args)
     elif args.command == "triage":
         triage(db, args)
+    elif args.command == "workload":
+        workload(db, args)
     elif args.command == "audit":
         audit(db, args)
+    elif args.command == "metrics":
+        metrics(db, args)
     else:
         parser.print_help()
 

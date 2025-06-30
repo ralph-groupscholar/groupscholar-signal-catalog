@@ -21,6 +21,10 @@
 - Added an update command to edit signal fields, append notes, or clear values while handling status transitions.
 - Documented update usage in the README examples.
 
+## Iteration 6
+- Added a metrics command to report open/closed counts, overdue/due-soon totals, age medians, and close-cycle timing.
+- Included severity rollups and oldest-open signal visibility plus README usage details.
+
 ## Iteration 83
 - Added an audit command to flag open signals missing owners, due dates, categories, severity, tags, or sources, plus aging/overdue alerts.
 - Documented audit usage in the README.
