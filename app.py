@@ -25,6 +25,7 @@ DEFAULT_METRICS_DUE_DAYS = 14
 DEFAULT_AUDIT_LIMIT = 8
 DEFAULT_AUDIT_STALE_DAYS = 21
 DEFAULT_WORKLOAD_DAYS = 14
+DEFAULT_STALE_DAYS = 14
 POSTGRES_SCHEMA = "groupscholar_signal_catalog"
 POSTGRES_TABLE = f"{POSTGRES_SCHEMA}.signals"
 
@@ -145,10 +146,16 @@ def init_db(db):
                 source TEXT,
                 tags TEXT,
                 created_at TEXT NOT NULL,
-                closed_at TEXT
+                closed_at TEXT,
+                updated_at TEXT
             )
             """
         )
+        cur.execute("PRAGMA table_info(signals)")
+        columns = [row[1] for row in cur.fetchall()]
+        if "updated_at" not in columns:
+            cur.execute("ALTER TABLE signals ADD COLUMN updated_at TEXT")
+        cur.execute("UPDATE signals SET updated_at = created_at WHERE updated_at IS NULL")
     else:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {POSTGRES_SCHEMA}")
         cur.execute(
@@ -165,10 +172,13 @@ def init_db(db):
                 source TEXT,
                 tags TEXT,
                 created_at TIMESTAMPTZ NOT NULL,
-                closed_at TIMESTAMPTZ
+                closed_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ
             )
             """
         )
+        cur.execute(f"ALTER TABLE {db.table} ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ")
+        cur.execute(f"UPDATE {db.table} SET updated_at = created_at WHERE updated_at IS NULL")
     conn.commit()
     conn.close()
 
@@ -177,6 +187,7 @@ def add_signal(db, args):
     conn = connect(db)
     cur = conn.cursor()
     p = placeholder(db)
+    created_at = utc_now()
     values = (
         args.title,
         args.category,
@@ -187,14 +198,15 @@ def add_signal(db, args):
         args.notes,
         args.source,
         args.tags,
-        utc_now(),
+        created_at,
+        created_at,
     )
     if db.backend == "sqlite":
         cur.execute(
             f"""
             INSERT INTO {db.table}
-            (title, category, severity, owner, due_date, status, notes, source, tags, created_at)
-            VALUES ({", ".join([p] * 10)})
+            (title, category, severity, owner, due_date, status, notes, source, tags, created_at, updated_at)
+            VALUES ({", ".join([p] * 11)})
             """,
             values,
         )
@@ -204,8 +216,8 @@ def add_signal(db, args):
         cur.execute(
             f"""
             INSERT INTO {db.table}
-            (title, category, severity, owner, due_date, status, notes, source, tags, created_at)
-            VALUES ({", ".join([p] * 10)})
+            (title, category, severity, owner, due_date, status, notes, source, tags, created_at, updated_at)
+            VALUES ({", ".join([p] * 11)})
             RETURNING id
             """,
             values,
@@ -339,8 +351,8 @@ def seed_signals(db):
     cur.executemany(
         f"""
         INSERT INTO {db.table}
-        (title, category, severity, owner, due_date, status, notes, source, tags, created_at, closed_at)
-        VALUES ({", ".join([p] * 11)})
+        (title, category, severity, owner, due_date, status, notes, source, tags, created_at, closed_at, updated_at)
+        VALUES ({", ".join([p] * 12)})
         """,
         [
             (
@@ -355,6 +367,7 @@ def seed_signals(db):
                 row["tags"],
                 row["created_at"],
                 row["closed_at"],
+                row["created_at"],
             )
             for row in seed_rows
         ],
@@ -465,11 +478,12 @@ def close_signal(db, signal_id, note):
     cur.execute(
         f"""
         UPDATE {db.table}
-        SET status = {p}, closed_at = {p}, notes = COALESCE(notes, '') || {p}
+        SET status = {p}, closed_at = {p}, updated_at = {p}, notes = COALESCE(notes, '') || {p}
         WHERE id = {p}
         """,
         (
             "closed",
+            utc_now(),
             utc_now(),
             f"\n[Closed] {note}" if note else "",
             signal_id,
@@ -493,11 +507,12 @@ def reopen_signal(db, signal_id, note):
     cur.execute(
         f"""
         UPDATE {db.table}
-        SET status = {p}, closed_at = NULL, notes = COALESCE(notes, '') || {p}
+        SET status = {p}, closed_at = NULL, updated_at = {p}, notes = COALESCE(notes, '') || {p}
         WHERE id = {p}
         """,
         (
             "open",
+            utc_now(),
             f"\n[Reopened] {note}" if note else "",
             signal_id,
         ),
@@ -592,6 +607,9 @@ def update_signal(db, args):
         print("No updates provided.")
         return
 
+    updates.append(f"updated_at = {p}")
+    values.append(utc_now())
+
     cur.execute(
         f"""
         UPDATE {db.table}
@@ -648,7 +666,7 @@ def export_csv(db, args):
 
     cur.execute(
         f"""
-        SELECT id, title, category, severity, owner, due_date, status, notes, source, tags, created_at, closed_at
+        SELECT id, title, category, severity, owner, due_date, status, notes, source, tags, created_at, closed_at, updated_at
         FROM {db.table}
         {clause}
         ORDER BY created_at DESC
@@ -1144,7 +1162,7 @@ def metrics(db, args):
 
     cur.execute(
         f"""
-        SELECT id, title, category, severity, owner, due_date, status, created_at, closed_at
+        SELECT id, title, category, severity, owner, due_date, status, created_at, closed_at, updated_at
         FROM {db.table}
         ORDER BY created_at DESC
         """
@@ -1164,6 +1182,7 @@ def metrics(db, args):
     open_due_soon = 0
     open_unassigned = 0
     open_by_severity = {"low": 0, "medium": 0, "high": 0, "critical": 0, "unspecified": 0}
+    open_stale = 0
 
     for row in open_rows:
         created_dt = parse_datetime(row["created_at"])
@@ -1178,6 +1197,9 @@ def metrics(db, args):
             open_unassigned += 1
         severity = row["severity"] or "unspecified"
         open_by_severity[severity] = open_by_severity.get(severity, 0) + 1
+        updated_dt = parse_datetime(row["updated_at"]) or created_dt
+        if updated_dt and (today - updated_dt).days >= args.stale_days:
+            open_stale += 1
 
     def avg(values):
         return round(sum(values) / len(values), 1) if values else 0
@@ -1209,6 +1231,7 @@ def metrics(db, args):
     print(f"Open overdue: {open_overdue}")
     print(f"Open due soon (next {args.due_days} days): {open_due_soon}")
     print(f"Open unassigned: {open_unassigned}")
+    print(f"Open stale (>= {args.stale_days} days since update): {open_stale}")
     print(f"Avg open age (days): {avg(open_ages)}")
     print(f"Median open age (days): {median(open_ages)}")
     print(f"Avg close cycle (days): {avg(closed_cycle)}")
@@ -1229,6 +1252,90 @@ def metrics(db, args):
         due = row["due_date"] or "No due date"
         category = row["category"] or "Unspecified"
         print(f"- [{row['id']}] {row['title']} ({category}) — {owner} — due {due} — {age_days} days open")
+
+
+def stale(db, args):
+    conn = connect(db)
+    cur = conn.cursor()
+    today = datetime.utcnow()
+
+    cur.execute(
+        f"""
+        SELECT id, title, category, severity, owner, due_date, status, created_at, updated_at
+        FROM {db.table}
+        WHERE status = 'open'
+        ORDER BY created_at DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        print("No open signals found.")
+        return
+
+    stale_rows = []
+    for row in rows:
+        updated_dt = parse_datetime(row["updated_at"]) or parse_datetime(row["created_at"])
+        if not updated_dt:
+            continue
+        age_days = (today - updated_dt).days
+        if age_days >= args.days:
+            stale_rows.append(
+                {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "severity": row["severity"] or DEFAULT_SEVERITY,
+                    "owner": row["owner"] or "Unassigned",
+                    "due": row["due_date"] or "No due date",
+                    "last_update": updated_dt.date().isoformat(),
+                    "age_days": age_days,
+                }
+            )
+
+    stale_rows.sort(key=lambda item: item["age_days"], reverse=True)
+
+    print("Stale Signal Snapshot")
+    print("----------------------")
+    print(f"Open signals: {len(rows)}")
+    print(f"Stale (>= {args.days} days since update): {len(stale_rows)}")
+
+    if not stale_rows:
+        print("\nNo stale signals found.")
+        return
+
+    columns = [
+        ("ID", "id"),
+        ("Title", "title"),
+        ("Severity", "severity"),
+        ("Owner", "owner"),
+        ("Due", "due"),
+        ("Last update", "last_update"),
+        ("Age(d)", "age_days"),
+    ]
+
+    widths = []
+    for label, key in columns:
+        width = len(label)
+        for row in stale_rows[: args.limit]:
+            value = "" if row[key] is None else str(row[key])
+            width = max(width, min(len(value), 40))
+        widths.append(width)
+
+    header = " | ".join(label.ljust(widths[i]) for i, (label, _) in enumerate(columns))
+    divider = "-+-".join("-" * widths[i] for i in range(len(columns)))
+    print("")
+    print(header)
+    print(divider)
+
+    for row in stale_rows[: args.limit]:
+        line = []
+        for i, (_, key) in enumerate(columns):
+            value = "" if row[key] is None else str(row[key])
+            if len(value) > 40:
+                value = value[:37] + "..."
+            line.append(value.ljust(widths[i]))
+        print(" | ".join(line))
 
 
 def build_parser():
@@ -1324,6 +1431,11 @@ def build_parser():
     metrics_parser = subparsers.add_parser("metrics", help="Show operational metrics for signals")
     metrics_parser.add_argument("--due-days", type=int, default=DEFAULT_METRICS_DUE_DAYS)
     metrics_parser.add_argument("--limit", type=int, default=8)
+    metrics_parser.add_argument("--stale-days", type=int, default=DEFAULT_STALE_DAYS)
+
+    stale_parser = subparsers.add_parser("stale", help="List open signals without recent updates")
+    stale_parser.add_argument("--days", type=int, default=DEFAULT_STALE_DAYS)
+    stale_parser.add_argument("--limit", type=int, default=8)
 
     return parser
 
@@ -1371,6 +1483,8 @@ def main():
         audit(db, args)
     elif args.command == "metrics":
         metrics(db, args)
+    elif args.command == "stale":
+        stale(db, args)
     else:
         parser.print_help()
 

@@ -32,3 +32,8 @@
 ## Iteration 84
 - Expanded the workload report to support markdown or table output with optional file export.
 - Updated the README with workload format and output examples.
+
+## Iteration 109
+- Added updated_at tracking for signals with automatic backfill and update on edits, close, and reopen.
+- Added a stale command plus metrics stale counts to surface open signals without recent updates.
+- Expanded exports to include updated_at and documented the new command in the README.
