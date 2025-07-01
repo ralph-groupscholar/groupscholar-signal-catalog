@@ -33,6 +33,10 @@
 - Expanded the workload report to support markdown or table output with optional file export.
 - Updated the README with workload format and output examples.
 
+## Iteration 113
+- Added a calendar command to group upcoming due dates by week with overdue, no-due, and beyond-horizon sections.
+- Documented calendar usage examples in the README.
+
 ## Iteration 109
 - Added updated_at tracking for signals with automatic backfill and update on edits, close, and reopen.
 - Added a stale command plus metrics stale counts to surface open signals without recent updates.

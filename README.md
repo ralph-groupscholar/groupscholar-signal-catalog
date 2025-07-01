@@ -43,6 +43,7 @@ python3 app.py --backend postgres seed
 - `digest`: generate a markdown digest of overdue, due soon, and recent signals
 - `triage`: rank open signals by urgency and ownership gaps
 - `workload`: summarize open-signal workload by owner with due buckets (table or markdown)
+- `calendar`: show upcoming due dates grouped by week (table or markdown)
 - `audit`: flag open signals missing owners, due dates, categories, severity, tags, or sources
 - `metrics`: show operational metrics like open age, overdue counts, stale items, and close cycle time
 - `stale`: list open signals that have not been updated recently
@@ -59,6 +60,8 @@ python3 app.py digest --days 14 --out data/weekly-digest.md
 python3 app.py triage --days 10 --limit 12
 python3 app.py workload --days 14
 python3 app.py workload --days 14 --format markdown --out data/workload.md
+python3 app.py calendar --days 30 --limit 6
+python3 app.py calendar --days 45 --format markdown --out data/signal-calendar.md
 python3 app.py audit --stale-days 21 --limit 10
 python3 app.py metrics --due-days 14 --stale-days 14 --limit 5
 python3 app.py stale --days 14 --limit 8

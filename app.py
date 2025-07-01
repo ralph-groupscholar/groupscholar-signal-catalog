@@ -26,6 +26,8 @@ DEFAULT_AUDIT_LIMIT = 8
 DEFAULT_AUDIT_STALE_DAYS = 21
 DEFAULT_WORKLOAD_DAYS = 14
 DEFAULT_STALE_DAYS = 14
+DEFAULT_CALENDAR_DAYS = 30
+DEFAULT_CALENDAR_LIMIT = 6
 POSTGRES_SCHEMA = "groupscholar_signal_catalog"
 POSTGRES_TABLE = f"{POSTGRES_SCHEMA}.signals"
 
@@ -1056,6 +1058,161 @@ def workload(db, args):
     print(output, end="")
 
 
+def calendar(db, args):
+    conn = connect(db)
+    cur = conn.cursor()
+    today = datetime.utcnow().date()
+    horizon = today + timedelta(days=args.days)
+
+    cur.execute(
+        f"""
+        SELECT id, title, category, severity, owner, due_date, status, created_at
+        FROM {db.table}
+        WHERE status = 'open'
+        ORDER BY created_at DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        print("No open signals found.")
+        return
+
+    overdue = []
+    due_today = []
+    no_due = []
+    beyond = []
+    upcoming_by_week = {}
+
+    for row in rows:
+        due = parse_date(row["due_date"])
+        if due is None:
+            no_due.append(row)
+            continue
+        if due < today:
+            overdue.append(row)
+            continue
+        if due == today:
+            due_today.append(row)
+            continue
+        if due <= horizon:
+            week_start = due - timedelta(days=due.weekday())
+            upcoming_by_week.setdefault(week_start, []).append(row)
+        else:
+            beyond.append(row)
+
+    def normalize_row(row):
+        due = parse_date(row["due_date"])
+        return {
+            "due": due.isoformat() if due else "No due date",
+            "id": row["id"],
+            "title": row["title"],
+            "owner": row["owner"] or "Unassigned",
+            "severity": row["severity"] or DEFAULT_SEVERITY,
+            "category": row["category"] or "Unspecified",
+        }
+
+    columns = [
+        ("Due", "due"),
+        ("ID", "id"),
+        ("Title", "title"),
+        ("Owner", "owner"),
+        ("Severity", "severity"),
+        ("Category", "category"),
+    ]
+
+    def build_table_section(label, section_rows):
+        if not section_rows:
+            return [label, "-" * len(label), "(none)"]
+
+        normalized = [normalize_row(row) for row in section_rows[: args.limit]]
+        widths = []
+        for col_label, key in columns:
+            width = len(col_label)
+            for item in normalized:
+                value = "" if item[key] is None else str(item[key])
+                width = max(width, min(len(value), 40))
+            widths.append(width)
+
+        header = " | ".join(col_label.ljust(widths[i]) for i, (col_label, _) in enumerate(columns))
+        divider = "-+-".join("-" * widths[i] for i in range(len(columns)))
+        lines = [label, "-" * len(label), header, divider]
+        for item in normalized:
+            row_line = []
+            for i, (_, key) in enumerate(columns):
+                value = "" if item[key] is None else str(item[key])
+                if len(value) > 40:
+                    value = value[:37] + "..."
+                row_line.append(value.ljust(widths[i]))
+            lines.append(" | ".join(row_line))
+        return lines
+
+    def build_markdown_section(label, section_rows):
+        lines = [f"## {label}", ""]
+        if not section_rows:
+            lines.append("- (none)")
+            lines.append("")
+            return lines
+        for row in section_rows[: args.limit]:
+            item = normalize_row(row)
+            lines.append(
+                f"- [{item['id']}] {item['title']} — {item['owner']} — due {item['due']} — "
+                f"{item['severity']} — {item['category']}"
+            )
+        lines.append("")
+        return lines
+
+    sections = []
+    if overdue:
+        sections.append(("Overdue Signals", sorted(overdue, key=lambda r: parse_date(r["due_date"]) or today)))
+    if due_today:
+        sections.append(("Due Today", sorted(due_today, key=lambda r: r["id"])))
+
+    for week_start in sorted(upcoming_by_week.keys()):
+        label = f"Week of {week_start.isoformat()}"
+        week_rows = sorted(upcoming_by_week[week_start], key=lambda r: parse_date(r["due_date"]) or horizon)
+        sections.append((label, week_rows))
+
+    if beyond:
+        sections.append((f"Beyond {horizon.isoformat()}", sorted(beyond, key=lambda r: parse_date(r["due_date"]) or horizon)))
+    if no_due:
+        sections.append(("No Due Date", sorted(no_due, key=lambda r: r["id"])))
+
+    if args.format == "markdown":
+        lines = [
+            "# Signal Calendar",
+            "",
+            f"- Open signals: {len(rows)}",
+            f"- Horizon: {args.days} days (through {horizon.isoformat()})",
+            "",
+        ]
+        for label, section_rows in sections:
+            lines.extend(build_markdown_section(label, section_rows))
+        output = "\n".join(lines).rstrip() + "\n"
+    else:
+        lines = [
+            "Signal Calendar Snapshot",
+            "------------------------",
+            f"Open signals: {len(rows)}",
+            f"Horizon: {args.days} days (through {horizon.isoformat()})",
+            "",
+        ]
+        for label, section_rows in sections:
+            lines.extend(build_table_section(label, section_rows))
+            lines.append("")
+        output = "\n".join(lines).rstrip() + "\n"
+
+    if args.out:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as handle:
+            handle.write(output)
+        print(f"Wrote calendar to {args.out}.")
+        return
+
+    print(output, end="")
+
+
 def audit(db, args):
     conn = connect(db)
     cur = conn.cursor()
@@ -1424,6 +1581,12 @@ def build_parser():
     workload_parser.add_argument("--format", choices=["table", "markdown"], default="table")
     workload_parser.add_argument("--out", help="Output file path for workload report")
 
+    calendar_parser = subparsers.add_parser("calendar", help="Show upcoming due dates by week")
+    calendar_parser.add_argument("--days", type=int, default=DEFAULT_CALENDAR_DAYS)
+    calendar_parser.add_argument("--limit", type=int, default=DEFAULT_CALENDAR_LIMIT)
+    calendar_parser.add_argument("--format", choices=["table", "markdown"], default="table")
+    calendar_parser.add_argument("--out", help="Output file path for calendar report")
+
     audit_parser = subparsers.add_parser("audit", help="Audit open signals for missing fields")
     audit_parser.add_argument("--limit", type=int, default=DEFAULT_AUDIT_LIMIT)
     audit_parser.add_argument("--stale-days", type=int, default=DEFAULT_AUDIT_STALE_DAYS)
@@ -1479,6 +1642,8 @@ def main():
         triage(db, args)
     elif args.command == "workload":
         workload(db, args)
+    elif args.command == "calendar":
+        calendar(db, args)
     elif args.command == "audit":
         audit(db, args)
     elif args.command == "metrics":
