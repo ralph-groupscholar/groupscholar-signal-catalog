@@ -41,3 +41,8 @@
 - Added updated_at tracking for signals with automatic backfill and update on edits, close, and reopen.
 - Added a stale command plus metrics stale counts to surface open signals without recent updates.
 - Expanded exports to include updated_at and documented the new command in the README.
+
+## Iteration 71
+- Added an activity report that summarizes newly created, closed, and updated signals within a recent window.
+- Added markdown output and file export options for the activity report.
+- Documented the new activity command in the README examples.

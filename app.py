@@ -28,6 +28,8 @@ DEFAULT_WORKLOAD_DAYS = 14
 DEFAULT_STALE_DAYS = 14
 DEFAULT_CALENDAR_DAYS = 30
 DEFAULT_CALENDAR_LIMIT = 6
+DEFAULT_ACTIVITY_DAYS = 7
+DEFAULT_ACTIVITY_LIMIT = 8
 POSTGRES_SCHEMA = "groupscholar_signal_catalog"
 POSTGRES_TABLE = f"{POSTGRES_SCHEMA}.signals"
 
@@ -1495,6 +1497,121 @@ def stale(db, args):
         print(" | ".join(line))
 
 
+def activity(db, args):
+    conn = connect(db)
+    cur = conn.cursor()
+    cutoff = datetime.utcnow() - timedelta(days=args.days)
+    p = placeholder(db)
+
+    cutoff_value = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ") if db.backend == "sqlite" else cutoff
+    cur.execute(
+        f"""
+        SELECT id, title, category, severity, owner, status, created_at, closed_at, updated_at
+        FROM {db.table}
+        WHERE created_at >= {p} OR closed_at >= {p} OR updated_at >= {p}
+        ORDER BY created_at DESC
+        """,
+        (cutoff_value, cutoff_value, cutoff_value),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        print("No recent signal activity found.")
+        return
+
+    created = []
+    closed = []
+    updated = []
+
+    for row in rows:
+        created_dt = parse_datetime(row["created_at"])
+        closed_dt = parse_datetime(row["closed_at"])
+        updated_dt = parse_datetime(row["updated_at"]) or created_dt
+
+        if created_dt and created_dt >= cutoff:
+            created.append((row, created_dt))
+        if closed_dt and closed_dt >= cutoff:
+            closed.append((row, closed_dt))
+        if updated_dt and updated_dt >= cutoff:
+            if not (created_dt and created_dt >= cutoff) and not (closed_dt and closed_dt >= cutoff):
+                updated.append((row, updated_dt))
+
+    created.sort(key=lambda item: item[1], reverse=True)
+    closed.sort(key=lambda item: item[1], reverse=True)
+    updated.sort(key=lambda item: item[1], reverse=True)
+
+    def line_for(row, label, when_dt):
+        owner = row["owner"] or "Unassigned"
+        category = row["category"] or "Unspecified"
+        severity = row["severity"] or DEFAULT_SEVERITY
+        when = when_dt.date().isoformat() if when_dt else "Unknown"
+        return f"- [{row['id']}] {row['title']} ({category}, {severity}) — {owner} — {label} {when}"
+
+    if args.format == "markdown":
+        lines = [
+            "# Signal Activity",
+            "",
+            f"- Window: last {args.days} days (since {cutoff.date().isoformat()})",
+            f"- New signals: {len(created)}",
+            f"- Closed signals: {len(closed)}",
+            f"- Updated signals: {len(updated)}",
+            "",
+        ]
+
+        def write_section(title, items, label):
+            lines.append(f"## {title}")
+            if not items:
+                lines.append("- (none)")
+                lines.append("")
+                return
+            for row, when_dt in items[: args.limit]:
+                lines.append(line_for(row, label, when_dt))
+            lines.append("")
+
+        write_section("New Signals", created, "created")
+        write_section("Closed Signals", closed, "closed")
+        write_section("Updated Signals", updated, "updated")
+
+        output = "\n".join(lines).rstrip() + "\n"
+    else:
+        lines = [
+            "Signal Activity Snapshot",
+            "-------------------------",
+            f"Window: last {args.days} days (since {cutoff.date().isoformat()})",
+            f"New signals: {len(created)}",
+            f"Closed signals: {len(closed)}",
+            f"Updated signals: {len(updated)}",
+            "",
+        ]
+
+        def write_section(title, items, label):
+            lines.append(title)
+            lines.append("-" * len(title))
+            if not items:
+                lines.append("(none)")
+                lines.append("")
+                return
+            for row, when_dt in items[: args.limit]:
+                lines.append(line_for(row, label, when_dt))
+            lines.append("")
+
+        write_section("New Signals", created, "created")
+        write_section("Closed Signals", closed, "closed")
+        write_section("Updated Signals", updated, "updated")
+
+        output = "\n".join(lines).rstrip() + "\n"
+
+    if args.out:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as handle:
+            handle.write(output)
+        print(f"Wrote activity report to {args.out}.")
+        return
+
+    print(output, end="")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Group Scholar Signal Catalog")
     parser.add_argument("--db", default=default_db_path(), help="Path to the SQLite database")
@@ -1600,6 +1717,12 @@ def build_parser():
     stale_parser.add_argument("--days", type=int, default=DEFAULT_STALE_DAYS)
     stale_parser.add_argument("--limit", type=int, default=8)
 
+    activity_parser = subparsers.add_parser("activity", help="Show recent signal activity")
+    activity_parser.add_argument("--days", type=int, default=DEFAULT_ACTIVITY_DAYS)
+    activity_parser.add_argument("--limit", type=int, default=DEFAULT_ACTIVITY_LIMIT)
+    activity_parser.add_argument("--format", choices=["table", "markdown"], default="table")
+    activity_parser.add_argument("--out", help="Output file path for activity report")
+
     return parser
 
 
@@ -1650,6 +1773,8 @@ def main():
         metrics(db, args)
     elif args.command == "stale":
         stale(db, args)
+    elif args.command == "activity":
+        activity(db, args)
     else:
         parser.print_help()
 

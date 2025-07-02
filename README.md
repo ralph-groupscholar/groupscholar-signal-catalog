@@ -47,6 +47,7 @@ python3 app.py --backend postgres seed
 - `audit`: flag open signals missing owners, due dates, categories, severity, tags, or sources
 - `metrics`: show operational metrics like open age, overdue counts, stale items, and close cycle time
 - `stale`: list open signals that have not been updated recently
+- `activity`: report new, closed, and updated signals in a recent window
 
 ## Examples
 
@@ -65,6 +66,8 @@ python3 app.py calendar --days 45 --format markdown --out data/signal-calendar.m
 python3 app.py audit --stale-days 21 --limit 10
 python3 app.py metrics --due-days 14 --stale-days 14 --limit 5
 python3 app.py stale --days 14 --limit 8
+python3 app.py activity --days 7 --limit 6
+python3 app.py activity --days 14 --format markdown --out data/signal-activity.md
 ```
 
 ## Data
