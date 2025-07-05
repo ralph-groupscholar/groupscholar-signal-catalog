@@ -29,7 +29,8 @@ DEFAULT_STALE_DAYS = 14
 DEFAULT_CALENDAR_DAYS = 30
 DEFAULT_CALENDAR_LIMIT = 6
 DEFAULT_ACTIVITY_DAYS = 7
-DEFAULT_ACTIVITY_LIMIT = 8
+DEFAULT_ACTIVITY_LIMIT = 6
+DEFAULT_TREND_WEEKS = 8
 POSTGRES_SCHEMA = "groupscholar_signal_catalog"
 POSTGRES_TABLE = f"{POSTGRES_SCHEMA}.signals"
 
@@ -85,6 +86,10 @@ def parse_datetime(value):
             except ValueError:
                 continue
     return None
+
+
+def start_of_week(day):
+    return day - timedelta(days=day.weekday())
 
 
 def default_db_path():
@@ -1500,105 +1505,169 @@ def stale(db, args):
 def activity(db, args):
     conn = connect(db)
     cur = conn.cursor()
-    cutoff = datetime.utcnow() - timedelta(days=args.days)
-    p = placeholder(db)
+    now = datetime.utcnow()
+    cutoff = now - timedelta(days=args.days)
 
-    cutoff_value = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ") if db.backend == "sqlite" else cutoff
     cur.execute(
         f"""
-        SELECT id, title, category, severity, owner, status, created_at, closed_at, updated_at
+        SELECT id, title, category, severity, owner, due_date, status, created_at, closed_at, updated_at
         FROM {db.table}
-        WHERE created_at >= {p} OR closed_at >= {p} OR updated_at >= {p}
         ORDER BY created_at DESC
-        """,
-        (cutoff_value, cutoff_value, cutoff_value),
+        """
     )
     rows = cur.fetchall()
     conn.close()
 
     if not rows:
-        print("No recent signal activity found.")
+        print("No signals found.")
         return
 
-    created = []
-    closed = []
-    updated = []
+    created_recent = []
+    closed_recent = []
+    activity_recent = []
+    owner_activity = {}
+    category_activity = {}
+    severity_activity = {}
+    due_soon = []
+    overdue_open = 0
 
     for row in rows:
         created_dt = parse_datetime(row["created_at"])
         closed_dt = parse_datetime(row["closed_at"])
-        updated_dt = parse_datetime(row["updated_at"]) or created_dt
+        updated_dt = parse_datetime(row["updated_at"])
+        due = parse_date(row["due_date"])
+
+        last_activity = max(
+            [dt for dt in (updated_dt, closed_dt, created_dt) if dt is not None],
+            default=None,
+        )
 
         if created_dt and created_dt >= cutoff:
-            created.append((row, created_dt))
+            created_recent.append(row)
         if closed_dt and closed_dt >= cutoff:
-            closed.append((row, closed_dt))
-        if updated_dt and updated_dt >= cutoff:
-            if not (created_dt and created_dt >= cutoff) and not (closed_dt and closed_dt >= cutoff):
-                updated.append((row, updated_dt))
+            closed_recent.append(row)
+        if last_activity and last_activity >= cutoff:
+            activity_recent.append((last_activity, row))
+            owner = row["owner"] or "Unassigned"
+            owner_activity[owner] = owner_activity.get(owner, 0) + 1
+            category = row["category"] or "Unspecified"
+            category_activity[category] = category_activity.get(category, 0) + 1
+            severity = row["severity"] or "unspecified"
+            severity_activity[severity] = severity_activity.get(severity, 0) + 1
 
-    created.sort(key=lambda item: item[1], reverse=True)
-    closed.sort(key=lambda item: item[1], reverse=True)
-    updated.sort(key=lambda item: item[1], reverse=True)
+        if row["status"] == "open":
+            if due and due < now.date():
+                overdue_open += 1
+            elif due and (due - now.date()).days <= args.days:
+                due_soon.append(row)
 
-    def line_for(row, label, when_dt):
+    activity_recent.sort(key=lambda item: item[0], reverse=True)
+
+    def format_line(row, activity_dt):
         owner = row["owner"] or "Unassigned"
+        due = row["due_date"] or "No due date"
         category = row["category"] or "Unspecified"
-        severity = row["severity"] or DEFAULT_SEVERITY
-        when = when_dt.date().isoformat() if when_dt else "Unknown"
-        return f"- [{row['id']}] {row['title']} ({category}, {severity}) — {owner} — {label} {when}"
+        activity_label = activity_dt.strftime("%Y-%m-%d")
+        return f"- [{row['id']}] {row['title']} ({category}) — {owner} — due {due} — last activity {activity_label}"
 
     if args.format == "markdown":
         lines = [
             "# Signal Activity",
             "",
-            f"- Window: last {args.days} days (since {cutoff.date().isoformat()})",
-            f"- New signals: {len(created)}",
-            f"- Closed signals: {len(closed)}",
-            f"- Updated signals: {len(updated)}",
+            "## Snapshot",
+            f"- Window: last {args.days} days (since {cutoff.date()})",
+            f"- Total signals: {len(rows)}",
+            f"- Signals created: {len(created_recent)}",
+            f"- Signals updated/closed: {len(activity_recent)}",
+            f"- Signals closed: {len(closed_recent)}",
+            f"- Open overdue: {overdue_open}",
+            f"- Open due soon (next {args.days} days): {len(due_soon)}",
             "",
+            "## Top Active Owners",
         ]
 
-        def write_section(title, items, label):
-            lines.append(f"## {title}")
-            if not items:
-                lines.append("- (none)")
-                lines.append("")
-                return
-            for row, when_dt in items[: args.limit]:
-                lines.append(line_for(row, label, when_dt))
-            lines.append("")
+        if owner_activity:
+            for owner, count in sorted(owner_activity.items(), key=lambda item: item[1], reverse=True)[
+                : args.limit
+            ]:
+                lines.append(f"- {owner}: {count}")
+        else:
+            lines.append("- None")
 
-        write_section("New Signals", created, "created")
-        write_section("Closed Signals", closed, "closed")
-        write_section("Updated Signals", updated, "updated")
+        lines.extend(["", "## Active Categories"])
+        if category_activity:
+            for category, count in sorted(category_activity.items(), key=lambda item: item[1], reverse=True)[
+                : args.limit
+            ]:
+                lines.append(f"- {category}: {count}")
+        else:
+            lines.append("- None")
+
+        lines.extend(["", "## Active Severity"])
+        if severity_activity:
+            for severity, count in sorted(severity_activity.items(), key=lambda item: item[1], reverse=True)[
+                : args.limit
+            ]:
+                lines.append(f"- {severity}: {count}")
+        else:
+            lines.append("- None")
+
+        lines.extend(["", "## Recent Activity"])
+        if activity_recent:
+            for activity_dt, row in activity_recent[: args.limit]:
+                lines.append(format_line(row, activity_dt))
+        else:
+            lines.append("- None")
 
         output = "\n".join(lines).rstrip() + "\n"
     else:
         lines = [
-            "Signal Activity Snapshot",
-            "-------------------------",
-            f"Window: last {args.days} days (since {cutoff.date().isoformat()})",
-            f"New signals: {len(created)}",
-            f"Closed signals: {len(closed)}",
-            f"Updated signals: {len(updated)}",
+            "Signal Activity",
+            "----------------",
+            f"Window: last {args.days} days (since {cutoff.date()})",
+            f"Total signals: {len(rows)}",
+            f"Signals created: {len(created_recent)}",
+            f"Signals updated/closed: {len(activity_recent)}",
+            f"Signals closed: {len(closed_recent)}",
+            f"Open overdue: {overdue_open}",
+            f"Open due soon (next {args.days} days): {len(due_soon)}",
             "",
+            "Top active owners",
+            "-----------------",
         ]
 
-        def write_section(title, items, label):
-            lines.append(title)
-            lines.append("-" * len(title))
-            if not items:
-                lines.append("(none)")
-                lines.append("")
-                return
-            for row, when_dt in items[: args.limit]:
-                lines.append(line_for(row, label, when_dt))
-            lines.append("")
+        if owner_activity:
+            for owner, count in sorted(owner_activity.items(), key=lambda item: item[1], reverse=True)[
+                : args.limit
+            ]:
+                lines.append(f"{owner}: {count}")
+        else:
+            lines.append("(none)")
 
-        write_section("New Signals", created, "created")
-        write_section("Closed Signals", closed, "closed")
-        write_section("Updated Signals", updated, "updated")
+        lines.extend(["", "Active categories", "-----------------"])
+        if category_activity:
+            for category, count in sorted(category_activity.items(), key=lambda item: item[1], reverse=True)[
+                : args.limit
+            ]:
+                lines.append(f"{category}: {count}")
+        else:
+            lines.append("(none)")
+
+        lines.extend(["", "Active severity", "---------------"])
+        if severity_activity:
+            for severity, count in sorted(severity_activity.items(), key=lambda item: item[1], reverse=True)[
+                : args.limit
+            ]:
+                lines.append(f"{severity}: {count}")
+        else:
+            lines.append("(none)")
+
+        lines.extend(["", "Recent activity", "---------------"])
+        if activity_recent:
+            for activity_dt, row in activity_recent[: args.limit]:
+                lines.append(format_line(row, activity_dt))
+        else:
+            lines.append("(none)")
 
         output = "\n".join(lines).rstrip() + "\n"
 
@@ -1607,6 +1676,147 @@ def activity(db, args):
         with open(args.out, "w", encoding="utf-8") as handle:
             handle.write(output)
         print(f"Wrote activity report to {args.out}.")
+        return
+
+    print(output, end="")
+
+
+def trend(db, args):
+    as_of = parse_date(args.as_of) if args.as_of else datetime.utcnow().date()
+    if args.as_of and as_of is None:
+        print("Invalid --as-of date. Use YYYY-MM-DD.")
+        return
+    if args.weeks <= 0:
+        print("Weeks must be greater than 0.")
+        return
+
+    week_start = start_of_week(as_of)
+    weeks = [week_start - timedelta(days=7 * offset) for offset in range(args.weeks)]
+    weeks = sorted(weeks)
+    earliest = weeks[0]
+
+    conn = connect(db)
+    cur = conn.cursor()
+    p = placeholder(db)
+    cutoff_value = (
+        earliest.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if db.backend == "sqlite"
+        else datetime.combine(earliest, datetime.min.time())
+    )
+    cur.execute(
+        f"""
+        SELECT id, created_at, closed_at
+        FROM {db.table}
+        WHERE created_at >= {p} OR closed_at >= {p}
+        """,
+        (cutoff_value, cutoff_value),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    buckets = {week: {"created": 0, "closed": 0, "close_cycles": []} for week in weeks}
+
+    for row in rows:
+        created_dt = parse_datetime(row["created_at"])
+        closed_dt = parse_datetime(row["closed_at"])
+
+        if created_dt:
+            created_week = start_of_week(created_dt.date())
+            if created_week in buckets:
+                buckets[created_week]["created"] += 1
+
+        if closed_dt:
+            closed_week = start_of_week(closed_dt.date())
+            if closed_week in buckets:
+                buckets[closed_week]["closed"] += 1
+                if created_dt:
+                    buckets[closed_week]["close_cycles"].append((closed_dt - created_dt).days)
+
+    rows_out = []
+    for week in weeks:
+        stats = buckets[week]
+        avg_close = (
+            round(sum(stats["close_cycles"]) / len(stats["close_cycles"]), 1)
+            if stats["close_cycles"]
+            else 0
+        )
+        rows_out.append(
+            {
+                "week": week.isoformat(),
+                "created": stats["created"],
+                "closed": stats["closed"],
+                "net": stats["created"] - stats["closed"],
+                "avg_close_days": avg_close,
+            }
+        )
+
+    columns = [
+        ("Week of", "week"),
+        ("Created", "created"),
+        ("Closed", "closed"),
+        ("Net", "net"),
+        ("Avg close days", "avg_close_days"),
+    ]
+
+    def build_table_lines():
+        widths = []
+        for label, key in columns:
+            width = len(label)
+            for row in rows_out:
+                value = "" if row[key] is None else str(row[key])
+                width = max(width, min(len(value), 40))
+            widths.append(width)
+
+        header = " | ".join(label.ljust(widths[i]) for i, (label, _) in enumerate(columns))
+        divider = "-+-".join("-" * widths[i] for i in range(len(columns)))
+        lines = [
+            "Signal Trend",
+            "------------",
+            f"As of: {as_of.isoformat()}",
+            f"Weeks: {args.weeks}",
+            "",
+            header,
+            divider,
+        ]
+        for row in rows_out:
+            line = []
+            for i, (_, key) in enumerate(columns):
+                value = "" if row[key] is None else str(row[key])
+                if len(value) > 40:
+                    value = value[:37] + "..."
+                line.append(value.ljust(widths[i]))
+            lines.append(" | ".join(line))
+        return lines
+
+    def build_markdown_lines():
+        header_cells = [label for label, _ in columns]
+        lines = [
+            "# Signal Trend",
+            "",
+            f"- As of: {as_of.isoformat()}",
+            f"- Weeks: {args.weeks}",
+            "",
+            "| " + " | ".join(header_cells) + " |",
+            "| " + " | ".join(["---"] * len(header_cells)) + " |",
+        ]
+        for row in rows_out:
+            lines.append(
+                "| "
+                + " | ".join(str(row[key]) if row[key] is not None else "" for _, key in columns)
+                + " |"
+            )
+        return lines
+
+    if args.format == "markdown":
+        output = "\n".join(build_markdown_lines()) + "\n"
+    else:
+        output = "\n".join(build_table_lines()) + "\n"
+
+    if args.out:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as handle:
+            handle.write(output)
+        print(f"Wrote trend report to {args.out}.")
         return
 
     print(output, end="")
@@ -1723,6 +1933,12 @@ def build_parser():
     activity_parser.add_argument("--format", choices=["table", "markdown"], default="table")
     activity_parser.add_argument("--out", help="Output file path for activity report")
 
+    trend_parser = subparsers.add_parser("trend", help="Show weekly created/closed trends")
+    trend_parser.add_argument("--weeks", type=int, default=DEFAULT_TREND_WEEKS)
+    trend_parser.add_argument("--as-of", help="End date for trend window (YYYY-MM-DD)")
+    trend_parser.add_argument("--format", choices=["table", "markdown"], default="table")
+    trend_parser.add_argument("--out", help="Output file path for trend report")
+
     return parser
 
 
@@ -1775,6 +1991,8 @@ def main():
         stale(db, args)
     elif args.command == "activity":
         activity(db, args)
+    elif args.command == "trend":
+        trend(db, args)
     else:
         parser.print_help()
 

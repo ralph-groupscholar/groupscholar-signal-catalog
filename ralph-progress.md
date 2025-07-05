@@ -42,7 +42,16 @@
 - Added a stale command plus metrics stale counts to surface open signals without recent updates.
 - Expanded exports to include updated_at and documented the new command in the README.
 
+## Iteration 70
+- Expanded the activity report with snapshot metrics, owner/category/severity rollups, and due-soon/overdue context.
+- Added a unit test covering the activity snapshot counts.
+
 ## Iteration 71
 - Added an activity report that summarizes newly created, closed, and updated signals within a recent window.
 - Added markdown output and file export options for the activity report.
 - Documented the new activity command in the README examples.
+
+## Iteration 72
+- Added a trend report that shows weekly created/closed volume, net change, and average close cycle time with optional markdown output.
+- Introduced an --as-of option for deterministic trend windows and created a unit test for trend counts.
+- Documented the new trend command in the README examples.
